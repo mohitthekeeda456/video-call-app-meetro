@@ -8,7 +8,23 @@ const participantSchema = new mongoose.Schema(
     role: { type: String, enum: ["host", "cohost", "participant"], default: "participant" },
     joinedAt: Date,
     leftAt: Date,
-    admitted: { type: Boolean, default: true }
+    admitted: { type: Boolean, default: true },
+    micMuted: { type: Boolean, default: false },
+    cameraOff: { type: Boolean, default: false },
+    isSharingScreen: { type: Boolean, default: false }
+  },
+  { _id: false }
+);
+
+const eventSchema = new mongoose.Schema(
+  {
+    type: { type: String, required: true },
+    actorId: String,
+    actorName: String,
+    targetUserId: String,
+    targetName: String,
+    createdAt: { type: Date, default: Date.now },
+    metadata: { type: Object, default: {} }
   },
   { _id: false }
 );
@@ -26,7 +42,9 @@ const meetingSchema = new mongoose.Schema(
     locked: { type: Boolean, default: false },
     requireApproval: { type: Boolean, default: false },
     participants: [participantSchema],
-    events: [{ type: Object }],
+    pendingParticipants: [participantSchema],
+    blockedParticipantIds: [{ type: String }],
+    events: [eventSchema],
     roomId: { type: String, required: true, unique: true }
   },
   { timestamps: true }

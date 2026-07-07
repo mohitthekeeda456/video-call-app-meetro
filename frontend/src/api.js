@@ -1,7 +1,11 @@
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
 
+export function getStoredToken() {
+  return localStorage.getItem("token");
+}
+
 export async function api(path, options = {}) {
-  const token = localStorage.getItem("token");
+  const token = getStoredToken();
   const response = await fetch(`${API_URL}${path}`, {
     ...options,
     headers: {
@@ -10,5 +14,9 @@ export async function api(path, options = {}) {
       ...(options.headers || {})
     }
   });
-  return response.json();
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "Request failed");
+  }
+  return data;
 }

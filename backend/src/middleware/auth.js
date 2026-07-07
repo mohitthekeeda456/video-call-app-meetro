@@ -1,5 +1,5 @@
-import jwt from "jsonwebtoken";
 import { User } from "../models/User.js";
+import { verifyAuthToken } from "../utils/auth.js";
 
 export async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.startsWith("Bearer ")
@@ -11,7 +11,7 @@ export async function requireAuth(req, res, next) {
   }
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET || "dev-secret");
+    const payload = verifyAuthToken(token);
     const user = await User.findById(payload.sub).select("-passwordHash");
     if (!user) {
       return res.status(401).json({ error: "Invalid token" });
