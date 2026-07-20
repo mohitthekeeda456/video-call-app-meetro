@@ -32,6 +32,53 @@ function findSocketIdForUser(roomId, userId) {
   return participant?.socketId || null;
 }
 
+async function handleParticipantDeparture(io, roomId, userId, actorName) {
+  if (!roomId || !userId) return;
+
+  const roomState = getRoomState(roomId);
+  roomState.delete(userId);
+
+  const meeting = await Meeting.findOne({ roomId });
+  if (meeting) {
+    const participantIndex = findParticipantIndex(meeting.participants, userId);
+    if (participantIndex >= 0) {
+      meeting.participants[participantIndex].leftAt = new Date();
+      const wasHost = meeting.participants[participantIndex].role === "host";
+
+      if (wasHost) {
+        const nextHost = chooseNextHost(meeting, listActiveParticipants(roomId));
+        if (nextHost) {
+          meeting.hostId = nextHost.userId;
+          meeting.hostName = nextHost.name;
+          meeting.participants[participantIndex].role = "participant";
+          nextHost.role = "host";
+          appendMeetingEvent(meeting, {
+            type: "host.transferred",
+            actorId: userId,
+            actorName,
+            targetUserId: nextHost.userId?.toString(),
+            targetName: nextHost.name
+          });
+          io.to(roomId).emit("room:host-changed", {
+            hostUserId: nextHost.userId?.toString(),
+            hostName: nextHost.name
+          });
+        }
+      }
+
+      appendMeetingEvent(meeting, {
+        type: "participant.left-room",
+        actorId: userId,
+        actorName
+      });
+      await meeting.save();
+    }
+  }
+
+  io.to(roomId).emit("room:participant-left", { userId });
+  await emitMeetingSnapshot(roomId);
+}
+
 export async function emitMeetingSnapshot(roomId) {
   if (!ioInstance) return;
   const meeting = await Meeting.findOne({ roomId });
@@ -368,49 +415,24 @@ export function registerMeetingSockets(server) {
       await emitMeetingSnapshot(roomId);
     }));
 
+    socket.on("meeting:leave", runSafely(async ({ roomId }, callback = () => {}) => {
+      await requireMeetingAccess(roomId, socket.data.user.id);
+      const departingRoomId = roomId;
+      const departingUserId = socket.data.user.id;
+      const departingName = socket.data.user.name;
+      socket.data.roomId = null;
+      socket.data.role = null;
+      callback({ ok: true });
+      handleParticipantDeparture(io, departingRoomId, departingUserId, departingName).catch((error) => {
+        socket.emit("room:error", { error: error.message });
+      });
+    }));
+
     socket.on("disconnect", runSafely(async () => {
       const roomId = socket.data.roomId;
       const userId = socket.data.user?.id;
 
-      if (!roomId || !userId) return;
-
-      const roomState = getRoomState(roomId);
-      roomState.delete(userId);
-
-      const meeting = await Meeting.findOne({ roomId });
-      if (meeting) {
-        const participantIndex = findParticipantIndex(meeting.participants, userId);
-        if (participantIndex >= 0) {
-          meeting.participants[participantIndex].leftAt = new Date();
-          const wasHost = meeting.participants[participantIndex].role === "host";
-
-          if (wasHost) {
-            const nextHost = chooseNextHost(meeting, listActiveParticipants(roomId));
-            if (nextHost) {
-              meeting.hostId = nextHost.userId;
-              meeting.hostName = nextHost.name;
-              meeting.participants[participantIndex].role = "participant";
-              nextHost.role = "host";
-              appendMeetingEvent(meeting, {
-                type: "host.transferred",
-                actorId: userId,
-                actorName: socket.data.user.name,
-                targetUserId: nextHost.userId?.toString(),
-                targetName: nextHost.name
-              });
-              io.to(roomId).emit("room:host-changed", {
-                hostUserId: nextHost.userId?.toString(),
-                hostName: nextHost.name
-              });
-            }
-          }
-
-          await meeting.save();
-        }
-      }
-
-      io.to(roomId).emit("room:participant-left", { userId });
-      await emitMeetingSnapshot(roomId);
+      await handleParticipantDeparture(io, roomId, userId, socket.data.user.name);
     }));
   });
 }

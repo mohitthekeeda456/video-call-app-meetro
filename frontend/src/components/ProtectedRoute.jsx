@@ -7,7 +7,13 @@ export function ProtectedRoute({ children }) {
   const location = useLocation();
 
   if (!ready) {
-    return <main className="page"><div className="panel">Checking your session...</div></main>;
+    return (
+      <main className="grid flex-1 place-items-center">
+        <div className="rounded-lg border border-white/70 bg-white/85 px-6 py-5 text-sm font-semibold text-slate-600 shadow-xl shadow-slate-900/5">
+          Checking your session...
+        </div>
+      </main>
+    );
   }
 
   if (!user) {
