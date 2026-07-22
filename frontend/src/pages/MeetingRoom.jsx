@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { io } from "socket.io-client";
 import { api, getStoredToken } from "../api.js";
 import { useAuth } from "../auth.jsx";
@@ -13,6 +13,11 @@ const rtcConfig = {
   ]
 };
 
+function formatMessageTime(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 export function MeetingRoom() {
   const { roomId } = useParams();
   const navigate = useNavigate();
@@ -25,8 +30,10 @@ export function MeetingRoom() {
   const screenTrackRef = useRef(null);
   const passcodeRef = useRef("");
   const joinedRef = useRef(false);
+  const chatScrollRef = useRef(null);
   const localMediaRef = useRef({
     micMuted: false,
+    micLocked: false,
     cameraOff: false,
     isSharingScreen: false
   });
@@ -46,16 +53,18 @@ export function MeetingRoom() {
   const [localMedia, setLocalMedia] = useState(localMediaRef.current);
   const [leaving, setLeaving] = useState(false);
   const [copiedInvite, setCopiedInvite] = useState(false);
+  const [mediaWarning, setMediaWarning] = useState("");
+  const currentUserId = user?.id || user?._id;
 
   const remoteParticipants = useMemo(() => {
-    if (!meeting || !user) return [];
+    if (!meeting || !currentUserId) return [];
     return meeting.participants
-      .filter((participant) => participant.userId !== user.id)
+      .filter((participant) => participant.userId !== currentUserId)
       .map((participant) => ({
         ...participant,
         stream: remoteStreamsRef.current.get(participant.userId) || null
       }));
-  }, [meeting, remoteVersion, user]);
+  }, [currentUserId, meeting, remoteVersion]);
 
   useEffect(() => {
     passcodeRef.current = passcode;
@@ -64,6 +73,17 @@ export function MeetingRoom() {
   useEffect(() => {
     joinedRef.current = joined;
   }, [joined]);
+
+  useEffect(() => {
+    if (meeting?.status === "ended" && !joined) {
+      navigate(`/meeting/${roomId}/highlights`, { replace: true });
+    }
+  }, [joined, meeting?.status, navigate, roomId]);
+
+  useEffect(() => {
+    if (!chatScrollRef.current) return;
+    chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+  }, [messages]);
 
   useEffect(() => {
     let active = true;
@@ -118,8 +138,8 @@ export function MeetingRoom() {
       setError("The host removed you from this meeting.");
     });
 
-    socket.on("meeting:mute-all", () => {
-      updateAudioMuted(true);
+    socket.on("meeting:media-control", ({ micMuted, micLocked, reason }) => {
+      applyRemoteMediaControl({ micMuted, micLocked, reason });
     });
 
     socket.on("meeting:ended", () => {
@@ -177,20 +197,57 @@ export function MeetingRoom() {
     setLocalPreviewStream(stream);
   }
 
+  function getMediaErrorMessage(nextError) {
+    if (["NotAllowedError", "PermissionDeniedError"].includes(nextError?.name)) {
+      return "Camera or microphone permission was denied. You joined without local audio/video, but you can still watch, listen, and chat.";
+    }
+
+    if (["NotReadableError", "TrackStartError"].includes(nextError?.name)) {
+      return "Your camera or microphone is already being used by another browser or app. You joined receive-only for now.";
+    }
+
+    return nextError?.message || "Could not access camera or microphone. You joined receive-only for now.";
+  }
+
+  async function requestUserMedia(constraints) {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Media devices are not available in this browser.");
+    }
+
+    return navigator.mediaDevices.getUserMedia(constraints);
+  }
+
   async function ensureLocalMedia() {
     if (localStreamRef.current) {
-      assignLocalPreview(localPreviewStream || localStreamRef.current);
+      assignLocalPreview(localStreamRef.current.getTracks().length ? localPreviewStream || localStreamRef.current : null);
       return localStreamRef.current;
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: true
-    });
+    const attempts = [
+      { constraints: { audio: true, video: true }, warning: "" },
+      { constraints: { audio: true, video: false }, warning: "Camera is unavailable, so you joined with microphone only." },
+      { constraints: { audio: false, video: true }, warning: "Microphone is unavailable, so you joined with camera only." }
+    ];
 
-    localStreamRef.current = stream;
-    assignLocalPreview(stream);
-    return stream;
+    let lastError = null;
+    for (const attempt of attempts) {
+      try {
+        const stream = await requestUserMedia(attempt.constraints);
+        localStreamRef.current = stream;
+        assignLocalPreview(stream);
+        setMediaWarning(attempt.warning);
+        return stream;
+      } catch (nextError) {
+        lastError = nextError;
+      }
+    }
+
+    const emptyStream = new MediaStream();
+    localStreamRef.current = emptyStream;
+    assignLocalPreview(null);
+    setMediaWarning(getMediaErrorMessage(lastError));
+    syncMediaState({ ...localMediaRef.current, micMuted: true, cameraOff: true });
+    return emptyStream;
   }
 
   function stopLocalMedia() {
@@ -240,6 +297,17 @@ export function MeetingRoom() {
       }
     }
 
+    const hasAudioSender = peer.getSenders().some((sender) => sender.track?.kind === "audio");
+    const hasVideoSender = peer.getSenders().some((sender) => sender.track?.kind === "video");
+
+    if (!hasAudioSender) {
+      peer.addTransceiver("audio", { direction: "recvonly" });
+    }
+
+    if (!hasVideoSender) {
+      peer.addTransceiver("video", { direction: "recvonly" });
+    }
+
     peer.onicecandidate = (event) => {
       if (event.candidate) {
         socketRef.current?.emit("signal:ice", {
@@ -256,7 +324,8 @@ export function MeetingRoom() {
         remoteStreamsRef.current.set(targetUserId, stream);
       }
 
-      for (const track of event.streams[0].getTracks()) {
+      const incomingTracks = event.streams[0]?.getTracks?.() || [event.track];
+      for (const track of incomingTracks) {
         const exists = stream.getTracks().some((existingTrack) => existingTrack.id === track.id);
         if (!exists) {
           stream.addTrack(track);
@@ -297,9 +366,32 @@ export function MeetingRoom() {
     });
   }
 
+  function applyRemoteMediaControl({ micMuted, micLocked, reason }) {
+    const audioTrack = localStreamRef.current?.getAudioTracks()?.[0];
+    if (audioTrack) {
+      audioTrack.enabled = !micMuted;
+    }
+    localMediaRef.current = {
+      ...localMediaRef.current,
+      micMuted: Boolean(micMuted),
+      micLocked: Boolean(micLocked)
+    };
+    setLocalMedia(localMediaRef.current);
+    if (reason) {
+      setMediaWarning(reason);
+    }
+  }
+
   function updateAudioMuted(forceValue) {
     const audioTrack = localStreamRef.current?.getAudioTracks()?.[0];
     const micMuted = typeof forceValue === "boolean" ? forceValue : !localMediaRef.current.micMuted;
+    if (localMediaRef.current.micLocked && !micMuted) {
+      setMediaWarning("A host muted you. You can unmute after a host allows it.");
+      return;
+    }
+    if (!audioTrack && !micMuted) {
+      setMediaWarning("No microphone track is available yet. Check browser permission or close another app using the mic.");
+    }
     if (audioTrack) {
       audioTrack.enabled = !micMuted;
     }
@@ -309,6 +401,9 @@ export function MeetingRoom() {
   function updateCameraOff(forceValue) {
     const videoTrack = localStreamRef.current?.getVideoTracks()?.[0];
     const cameraOff = typeof forceValue === "boolean" ? forceValue : !localMediaRef.current.cameraOff;
+    if (!videoTrack && !cameraOff) {
+      setMediaWarning("No camera track is available yet. Check browser permission or close another app using the camera.");
+    }
     if (videoTrack && !localMediaRef.current.isSharingScreen) {
       videoTrack.enabled = !cameraOff;
     }
@@ -342,21 +437,30 @@ export function MeetingRoom() {
   }
 
   async function toggleScreenShare() {
-    if (localMediaRef.current.isSharingScreen) {
-      await stopScreenShare();
-      return;
+    try {
+      if (localMediaRef.current.isSharingScreen) {
+        await stopScreenShare();
+        return;
+      }
+
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        throw new Error("Screen sharing is not available in this browser.");
+      }
+
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screenTrack = displayStream.getVideoTracks()[0];
+      screenTrackRef.current = screenTrack;
+      screenTrack.onended = () => {
+        stopScreenShare().catch(() => {});
+      };
+
+      await replaceOutgoingVideoTrack(screenTrack);
+      assignLocalPreview(new MediaStream([screenTrack, ...(localStreamRef.current?.getAudioTracks() || [])]));
+      setMediaWarning("");
+      syncMediaState({ ...localMediaRef.current, isSharingScreen: true });
+    } catch (nextError) {
+      setMediaWarning(nextError?.message || "Screen sharing was cancelled or blocked.");
     }
-
-    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-    const screenTrack = displayStream.getVideoTracks()[0];
-    screenTrackRef.current = screenTrack;
-    screenTrack.onended = () => {
-      stopScreenShare().catch(() => {});
-    };
-
-    await replaceOutgoingVideoTrack(screenTrack);
-    assignLocalPreview(new MediaStream([screenTrack, ...(localStreamRef.current?.getAudioTracks() || [])]));
-    syncMediaState({ ...localMediaRef.current, isSharingScreen: true });
   }
 
   async function joinSocketRoom() {
@@ -443,6 +547,11 @@ export function MeetingRoom() {
     try {
       teardownPeers();
       stopLocalMedia();
+      if (socketRef.current?.connected) {
+        await new Promise((resolve) => {
+          socketRef.current.emit("meeting:leave", { roomId }, () => resolve());
+        });
+      }
       socketRef.current?.disconnect();
       setJoined(false);
       setWaiting(false);
@@ -454,6 +563,14 @@ export function MeetingRoom() {
 
   const localRole = meeting?.selfRole || "participant";
   const canModerate = Boolean(meeting?.canModerate);
+  const scheduledEndAt = meeting ? new Date(new Date(meeting.scheduledAt).getTime() + meeting.durationMinutes * 60 * 1000) : null;
+  const canRemoveParticipant = (participant) => {
+    if (!canModerate || participant.userId === currentUserId) return false;
+    if (localRole === "host") return participant.role === "cohost" || participant.role === "participant";
+    if (localRole === "cohost") return participant.role === "participant";
+    return false;
+  };
+  const canControlParticipantAudio = (participant) => canRemoveParticipant(participant);
 
   if (loading) {
     return (
@@ -486,7 +603,10 @@ export function MeetingRoom() {
           </div>
           <h1 className="truncate text-3xl font-black text-slate-950">{meeting.title}</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">{meeting.description || "No meeting description provided."}</p>
-          <p className="mt-3 text-sm font-semibold text-slate-600">{new Date(meeting.scheduledAt).toLocaleString()}</p>
+          <p className="mt-3 text-sm font-semibold text-slate-600">
+            Starts {new Date(meeting.scheduledAt).toLocaleString()} | Planned for {meeting.durationMinutes} min
+            {scheduledEndAt ? ` | Ends around ${scheduledEndAt.toLocaleTimeString()}` : ""}
+          </p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="rounded-md border border-slate-200 bg-white px-4 py-2 text-sm font-bold text-slate-700 transition hover:-translate-y-0.5 hover:shadow-md" onClick={copyInvite}>
               {copiedInvite ? "Invite copied" : "Copy invite"}
@@ -495,7 +615,17 @@ export function MeetingRoom() {
           </div>
         </div>
         <div className="grid content-start gap-3 rounded-lg bg-slate-950 p-4 text-white">
-          {!joined && !waiting && !roomEnded ? (
+          {meeting.status === "ended" ? (
+            <div className="grid gap-3">
+              <div className="rounded-md border border-cyan-300/40 bg-cyan-300/10 px-4 py-3 text-sm font-semibold text-cyan-100">
+                This meeting has ended. The live room is closed.
+              </div>
+              <Link className="rounded-md bg-cyan-400 px-5 py-3 text-center font-black text-slate-950 transition hover:-translate-y-0.5 hover:bg-cyan-300" to={`/meeting/${roomId}/highlights`}>
+                View highlights
+              </Link>
+            </div>
+          ) : null}
+          {!joined && !waiting && !roomEnded && meeting.status !== "ended" ? (
             <>
               {meeting.hasPasscode ? (
                 <input
@@ -513,6 +643,7 @@ export function MeetingRoom() {
           {waiting ? <div className="rounded-md border border-amber-300/40 bg-amber-300/10 px-4 py-3 text-sm font-semibold text-amber-100">Waiting for the host to admit you.</div> : null}
           {roomEnded ? <div className="rounded-md border border-red-300/40 bg-red-300/10 px-4 py-3 text-sm font-semibold text-red-100">This meeting has ended.</div> : null}
           {error ? <div className="rounded-md border border-red-300/40 bg-red-300/10 px-4 py-3 text-sm font-semibold text-red-100">{error}</div> : null}
+          {mediaWarning ? <div className="rounded-md border border-amber-300/40 bg-amber-300/10 px-4 py-3 text-sm font-semibold text-amber-100">{mediaWarning}</div> : null}
         </div>
       </section>
 
@@ -539,7 +670,7 @@ export function MeetingRoom() {
           <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-xl shadow-slate-950/5">
             <div className="flex flex-wrap gap-2">
               <button className={`rounded-md px-4 py-2 text-sm font-black transition disabled:cursor-not-allowed disabled:opacity-50 ${localMedia.micMuted ? "bg-red-100 text-red-700 hover:bg-red-200" : "bg-slate-950 text-white hover:bg-cyan-700"}`} onClick={() => updateAudioMuted()} disabled={!joined}>
-                {localMedia.micMuted ? "Unmute" : "Mute"}
+                {localMedia.micMuted ? (localMedia.micLocked ? "Muted by host" : "Unmute") : "Mute"}
               </button>
               <button className={`rounded-md px-4 py-2 text-sm font-black transition disabled:cursor-not-allowed disabled:opacity-50 ${localMedia.cameraOff ? "bg-amber-100 text-amber-800 hover:bg-amber-200" : "bg-slate-100 text-slate-800 hover:bg-slate-200"}`} onClick={() => updateCameraOff()} disabled={!joined}>
                 {localMedia.cameraOff ? "Camera on" : "Camera off"}
@@ -550,6 +681,11 @@ export function MeetingRoom() {
               {canModerate ? (
                 <button className="rounded-md bg-cyan-50 px-4 py-2 text-sm font-black text-cyan-800 transition hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => socketRef.current?.emit("host:mute-all", { roomId })} disabled={!joined}>
                   Mute all
+                </button>
+              ) : null}
+              {canModerate ? (
+                <button className="rounded-md bg-emerald-50 px-4 py-2 text-sm font-black text-emerald-800 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => socketRef.current?.emit("host:unmute-all", { roomId })} disabled={!joined}>
+                  Unmute all
                 </button>
               ) : null}
               {canModerate ? (
@@ -587,20 +723,27 @@ export function MeetingRoom() {
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <strong className="block truncate text-sm text-slate-950">{participant.name}</strong>
-                      <p className="text-xs font-semibold text-slate-500">{participant.role}{participant.isActive ? " | live" : ""}</p>
+                      <p className="text-xs font-semibold text-slate-500">{participant.role}{participant.isActive ? " | live" : ""}{participant.micLocked ? " | muted by host" : participant.micMuted ? " | muted" : ""}</p>
                     </div>
                     {participant.isActive ? <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-emerald-500" /> : null}
                   </div>
-                  {canModerate && participant.userId !== user.id ? (
+                  {canRemoveParticipant(participant) || canControlParticipantAudio(participant) || (localRole === "host" && participant.role === "participant") ? (
                     <div className="mt-3 flex flex-wrap gap-2">
                       {localRole === "host" && participant.role === "participant" ? (
                         <button className="rounded-md bg-cyan-100 px-3 py-1.5 text-xs font-black text-cyan-800 transition hover:bg-cyan-200" onClick={() => socketRef.current?.emit("host:make-cohost", { roomId, targetUserId: participant.userId })}>
                           Make co-host
                         </button>
                       ) : null}
-                      <button className="rounded-md bg-red-100 px-3 py-1.5 text-xs font-black text-red-700 transition hover:bg-red-200" onClick={() => socketRef.current?.emit("host:remove", { roomId, targetUserId: participant.userId })}>
-                        Remove
-                      </button>
+                      {canControlParticipantAudio(participant) ? (
+                        <button className="rounded-md bg-slate-200 px-3 py-1.5 text-xs font-black text-slate-800 transition hover:bg-slate-300" onClick={() => socketRef.current?.emit("host:set-participant-mute", { roomId, targetUserId: participant.userId, muted: !participant.micLocked })}>
+                          {participant.micLocked ? "Allow unmute" : "Mute"}
+                        </button>
+                      ) : null}
+                      {canRemoveParticipant(participant) ? (
+                        <button className="rounded-md bg-red-100 px-3 py-1.5 text-xs font-black text-red-700 transition hover:bg-red-200" onClick={() => socketRef.current?.emit("host:remove", { roomId, targetUserId: participant.userId })}>
+                          Remove
+                        </button>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -640,10 +783,13 @@ export function MeetingRoom() {
             <div className="mb-3 flex items-center justify-between gap-3">
               <h2 className="text-lg font-black text-slate-950">Chat</h2>
             </div>
-            <div className="grid max-h-72 gap-2 overflow-auto pr-1">
+            <div className="grid max-h-72 gap-2 overflow-auto pr-1" ref={chatScrollRef}>
               {messages.map((message) => (
                 <article className="rounded-md bg-slate-50 p-3" key={message._id || `${message.senderName}-${message.createdAt}`}>
-                  <strong className="block text-sm text-slate-950">{message.senderName}</strong>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <strong className="text-sm text-slate-950">{message.senderName}</strong>
+                    <time className="text-xs font-bold text-slate-400">{formatMessageTime(message.createdAt)}</time>
+                  </div>
                   <p className="mt-1 text-sm leading-5 text-slate-600">{message.text}</p>
                 </article>
               ))}

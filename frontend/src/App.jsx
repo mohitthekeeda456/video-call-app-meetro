@@ -2,6 +2,7 @@ import React from "react";
 import { Link, Navigate, Route, Routes } from "react-router-dom";
 import { AuthPage } from "./pages/AuthPage.jsx";
 import { Dashboard } from "./pages/Dashboard.jsx";
+import { MeetingHighlights } from "./pages/MeetingHighlights.jsx";
 import { MeetingRoom } from "./pages/MeetingRoom.jsx";
 import { ScheduleMeeting } from "./pages/ScheduleMeeting.jsx";
 import { ProtectedRoute } from "./components/ProtectedRoute.jsx";
@@ -44,6 +45,7 @@ export default function App() {
           <Route path="/auth" element={<AuthPage />} />
           <Route path="/schedule" element={<ProtectedRoute><ScheduleMeeting /></ProtectedRoute>} />
           <Route path="/meeting/:roomId" element={<ProtectedRoute><MeetingRoom /></ProtectedRoute>} />
+          <Route path="/meeting/:roomId/highlights" element={<ProtectedRoute><MeetingHighlights /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </div>

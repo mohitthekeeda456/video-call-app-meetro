@@ -70,6 +70,35 @@ meetingsRouter.get("/room/:roomId", async (req, res) => {
   });
 });
 
+meetingsRouter.get("/room/:roomId/highlights", async (req, res) => {
+  const meeting = await Meeting.findOne({ roomId: req.params.roomId });
+  if (!meeting) return res.status(404).json({ error: "Not found" });
+
+  const canView =
+    meeting.hostId.toString() === req.user._id.toString() ||
+    meeting.participants.some((participant) => participant.email === req.user.email);
+
+  if (!canView) {
+    return res.status(403).json({ error: "You do not have access to this meeting" });
+  }
+
+  const messages = await Message.find({ meetingId: meeting._id }).sort({ createdAt: 1 }).limit(200);
+  res.json({
+    meeting: serializeMeeting(meeting, req.user._id, [], { includeEndedParticipants: true }),
+    messages,
+    participantHistory: meeting.participants.map((participant) => ({
+      userId: participant.userId?.toString(),
+      name: participant.name,
+      email: participant.email,
+      role: participant.role,
+      joinedAt: participant.joinedAt,
+      leftAt: participant.leftAt,
+      admitted: participant.admitted
+    })),
+    events: meeting.events
+  });
+});
+
 meetingsRouter.post("/room/:roomId/access", async (req, res) => {
   const meeting = await Meeting.findOne({ roomId: req.params.roomId });
   if (!meeting) return res.status(404).json({ error: "Not found" });

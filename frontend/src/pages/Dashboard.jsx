@@ -124,10 +124,16 @@ export function Dashboard() {
                 <p className="mt-2 min-h-10 text-sm leading-5 text-slate-500">{meeting.description || "No description yet."}</p>
                 <p className="mt-4 rounded-md bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-600">{new Date(meeting.scheduledAt).toLocaleString()}</p>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <Link to={`/meeting/${meeting.roomId}`} className="rounded-md bg-slate-950 px-4 py-2 text-sm font-black text-white transition hover:bg-cyan-700">Open room</Link>
-                  <button className="rounded-md border border-slate-200 px-4 py-2 text-sm font-bold text-slate-700 transition hover:bg-slate-50" onClick={() => copyInvite(meeting)}>
-                    {copiedMeetingId === meeting.id ? "Copied" : "Copy invite"}
-                  </button>
+                  {meeting.status === "ended" ? (
+                    <Link to={`/meeting/${meeting.roomId}/highlights`} className="rounded-md bg-slate-950 px-4 py-2 text-sm font-black text-white transition hover:bg-cyan-700">View highlights</Link>
+                  ) : (
+                    <>
+                      <Link to={`/meeting/${meeting.roomId}`} className="rounded-md bg-slate-950 px-4 py-2 text-sm font-black text-white transition hover:bg-cyan-700">Open room</Link>
+                      <button className="rounded-md border border-slate-200 px-4 py-2 text-sm font-bold text-slate-700 transition hover:bg-slate-50" onClick={() => copyInvite(meeting)}>
+                        {copiedMeetingId === meeting.id ? "Copied" : "Copy invite"}
+                      </button>
+                    </>
+                  )}
                 </div>
               </article>
             ))}

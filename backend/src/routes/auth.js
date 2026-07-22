@@ -17,7 +17,7 @@ authRouter.post("/register", async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 10);
   const user = await User.create({ name, email, passwordHash });
   const token = signAuthToken(user);
-  res.status(201).json({ token, user: { id: user._id, name: user.name, email: user.email } });
+  res.status(201).json({ token, user: { id: user._id.toString(), name: user.name, email: user.email } });
 });
 
 authRouter.post("/login", async (req, res) => {
@@ -28,5 +28,5 @@ authRouter.post("/login", async (req, res) => {
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(400).json({ error: "Invalid credentials" });
   const token = signAuthToken(user);
-  res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
+  res.json({ token, user: { id: user._id.toString(), name: user.name, email: user.email } });
 });

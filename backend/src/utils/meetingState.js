@@ -2,6 +2,36 @@ export function isHostLike(participant) {
   return participant?.role === "host" || participant?.role === "cohost";
 }
 
+export function canRemoveParticipant(actor, target) {
+  if (!actor || !target) return false;
+  if (actor.userId?.toString() === target.userId?.toString()) return false;
+
+  if (actor.role === "host") {
+    return target.role === "cohost" || target.role === "participant";
+  }
+
+  if (actor.role === "cohost") {
+    return target.role === "participant";
+  }
+
+  return false;
+}
+
+export function canModerateParticipant(actor, target) {
+  if (!actor || !target) return false;
+  if (actor.userId?.toString() === target.userId?.toString()) return false;
+
+  if (actor.role === "host") {
+    return target.role === "cohost" || target.role === "participant";
+  }
+
+  if (actor.role === "cohost") {
+    return target.role === "participant";
+  }
+
+  return false;
+}
+
 export function appendMeetingEvent(meeting, event) {
   meeting.events.push({
     createdAt: new Date(),
@@ -19,6 +49,7 @@ export function ensureParticipant(collection, participantInput) {
   const nextParticipant = {
     admitted: true,
     micMuted: false,
+    micLocked: false,
     cameraOff: false,
     isSharingScreen: false,
     ...participantInput
@@ -59,11 +90,16 @@ export function chooseNextHost(meeting, activeParticipants = []) {
   );
 }
 
-export function serializeMeeting(meeting, viewerId, activeParticipants = []) {
+export function serializeMeeting(meeting, viewerId, activeParticipants = [], options = {}) {
   const viewerIdString = viewerId?.toString?.() || "";
   const activeByUserId = new Map(activeParticipants.map((participant) => [participant.userId, participant]));
   const viewerParticipant = meeting.participants.find((participant) => participant.userId?.toString() === viewerIdString);
   const canModerate = isHostLike(viewerParticipant) || meeting.hostId.toString() === viewerIdString;
+  const visibleParticipants = meeting.participants.filter((participant) => {
+    if (options.includeEndedParticipants) return true;
+    const participantId = participant.userId?.toString();
+    return !participant.leftAt || activeByUserId.has(participantId) || participantId === viewerIdString;
+  });
 
   return {
     id: meeting._id.toString(),
@@ -78,7 +114,7 @@ export function serializeMeeting(meeting, viewerId, activeParticipants = []) {
     locked: meeting.locked,
     requireApproval: meeting.requireApproval,
     hasPasscode: Boolean(meeting.passcode),
-    participants: meeting.participants.map((participant) => {
+    participants: visibleParticipants.map((participant) => {
       const active = activeByUserId.get(participant.userId?.toString());
       return {
         userId: participant.userId?.toString(),
@@ -89,6 +125,7 @@ export function serializeMeeting(meeting, viewerId, activeParticipants = []) {
         leftAt: participant.leftAt,
         admitted: participant.admitted,
         micMuted: active?.micMuted ?? participant.micMuted ?? false,
+        micLocked: active?.micLocked ?? participant.micLocked ?? false,
         cameraOff: active?.cameraOff ?? participant.cameraOff ?? false,
         isSharingScreen: active?.isSharingScreen ?? participant.isSharingScreen ?? false,
         isActive: active?.isActive ?? false

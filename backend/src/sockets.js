@@ -5,6 +5,8 @@ import { Message } from "./models/Message.js";
 import { verifyAuthToken } from "./utils/auth.js";
 import {
   appendMeetingEvent,
+  canModerateParticipant,
+  canRemoveParticipant,
   chooseNextHost,
   ensureParticipant,
   findParticipantIndex,
@@ -30,6 +32,25 @@ function listActiveParticipants(roomId) {
 function findSocketIdForUser(roomId, userId) {
   const participant = getRoomState(roomId).get(userId);
   return participant?.socketId || null;
+}
+
+function scheduledEndTime(meeting) {
+  return new Date(new Date(meeting.scheduledAt).getTime() + meeting.durationMinutes * 60 * 1000);
+}
+
+async function endMeetingIfEmptyAfterDuration(io, meeting, roomId) {
+  if (!meeting || meeting.status === "ended") return;
+  if (listActiveParticipants(roomId).length > 0) return;
+  if (Date.now() < scheduledEndTime(meeting).getTime()) return;
+
+  meeting.status = "ended";
+  appendMeetingEvent(meeting, {
+    type: "meeting.auto-ended-empty-after-duration",
+    actorName: "System"
+  });
+  await meeting.save();
+  io.to(roomId).emit("meeting:ended");
+  activeRooms.delete(roomId);
 }
 
 async function handleParticipantDeparture(io, roomId, userId, actorName) {
@@ -71,6 +92,7 @@ async function handleParticipantDeparture(io, roomId, userId, actorName) {
         actorId: userId,
         actorName
       });
+      await endMeetingIfEmptyAfterDuration(io, meeting, roomId);
       await meeting.save();
     }
   }
@@ -187,6 +209,7 @@ export function registerMeetingSockets(server) {
           name: socket.data.user.name,
           role: participant.role,
           micMuted: participant.micMuted ?? false,
+          micLocked: participant.micLocked ?? false,
           cameraOff: participant.cameraOff ?? false,
           isSharingScreen: participant.isSharingScreen ?? false,
           isActive: true
@@ -271,10 +294,26 @@ export function registerMeetingSockets(server) {
       if (meeting) {
         const index = findParticipantIndex(meeting.participants, socket.data.user.id);
         if (index >= 0) {
-          meeting.participants[index].micMuted = micMuted;
+          const participant = meeting.participants[index];
+          const forcedMuted = participant.micLocked && !isHostLike(participant);
+          meeting.participants[index].micMuted = forcedMuted ? true : micMuted;
           meeting.participants[index].cameraOff = cameraOff;
           meeting.participants[index].isSharingScreen = isSharingScreen;
           await meeting.save();
+
+          if (forcedMuted) {
+            roomState.set(socket.data.user.id, {
+              ...activeParticipant,
+              micMuted: true,
+              cameraOff,
+              isSharingScreen
+            });
+            socket.emit("meeting:media-control", {
+              micMuted: true,
+              micLocked: true,
+              reason: "A host has muted you. You can unmute after a host allows it."
+            });
+          }
         }
       }
 
@@ -302,13 +341,108 @@ export function registerMeetingSockets(server) {
       const { meeting, participant } = await requireMeetingAccess(roomId, socket.data.user.id);
       if (!isHostLike(participant)) return;
 
+      for (const target of meeting.participants) {
+        if (target.userId?.toString() !== socket.data.user.id && canModerateParticipant(participant, target)) {
+          target.micMuted = true;
+          target.micLocked = true;
+          const activeParticipant = getRoomState(roomId).get(target.userId?.toString());
+          if (activeParticipant) {
+            getRoomState(roomId).set(target.userId?.toString(), {
+              ...activeParticipant,
+              micMuted: true,
+              micLocked: true
+            });
+          }
+        }
+      }
       appendMeetingEvent(meeting, {
         type: "host.mute-all",
         actorId: socket.data.user.id,
         actorName: socket.data.user.name
       });
       await meeting.save();
-      io.to(roomId).emit("meeting:mute-all");
+      for (const target of meeting.participants) {
+        if (target.userId?.toString() !== socket.data.user.id && canModerateParticipant(participant, target)) {
+          io.to(`user:${target.userId.toString()}`).emit("meeting:media-control", {
+            micMuted: true,
+            micLocked: true,
+            reason: "A host muted everyone. You can unmute after a host allows it."
+          });
+        }
+      }
+      await emitMeetingSnapshot(roomId);
+    }));
+
+    socket.on("host:unmute-all", runSafely(async ({ roomId }) => {
+      const { meeting, participant } = await requireMeetingAccess(roomId, socket.data.user.id);
+      if (!isHostLike(participant)) return;
+
+      for (const target of meeting.participants) {
+        if (target.userId?.toString() !== socket.data.user.id && canModerateParticipant(participant, target)) {
+          target.micMuted = false;
+          target.micLocked = false;
+          const activeParticipant = getRoomState(roomId).get(target.userId?.toString());
+          if (activeParticipant) {
+            getRoomState(roomId).set(target.userId?.toString(), {
+              ...activeParticipant,
+              micMuted: false,
+              micLocked: false
+            });
+          }
+          io.to(`user:${target.userId.toString()}`).emit("meeting:media-control", {
+            micMuted: false,
+            micLocked: false,
+            reason: "A host allowed everyone to unmute."
+          });
+        }
+      }
+
+      appendMeetingEvent(meeting, {
+        type: "host.unmute-all",
+        actorId: socket.data.user.id,
+        actorName: socket.data.user.name
+      });
+      await meeting.save();
+      await emitMeetingSnapshot(roomId);
+    }));
+
+    socket.on("host:set-participant-mute", runSafely(async ({ roomId, targetUserId, muted }) => {
+      const { meeting, participant } = await requireMeetingAccess(roomId, socket.data.user.id);
+      if (!isHostLike(participant)) return;
+
+      const targetIndex = findParticipantIndex(meeting.participants, targetUserId);
+      if (targetIndex < 0) return;
+      const target = meeting.participants[targetIndex];
+      if (!canModerateParticipant(participant, target)) {
+        throw new Error("You do not have permission to control this participant");
+      }
+
+      target.micMuted = Boolean(muted);
+      target.micLocked = Boolean(muted);
+      const activeParticipant = getRoomState(roomId).get(targetUserId);
+      if (activeParticipant) {
+        getRoomState(roomId).set(targetUserId, {
+          ...activeParticipant,
+          micMuted: Boolean(muted),
+          micLocked: Boolean(muted)
+        });
+      }
+
+      appendMeetingEvent(meeting, {
+        type: muted ? "host.muted-participant" : "host.allowed-participant-unmute",
+        actorId: socket.data.user.id,
+        actorName: socket.data.user.name,
+        targetUserId: targetUserId.toString(),
+        targetName: target.name
+      });
+      await meeting.save();
+
+      io.to(`user:${targetUserId}`).emit("meeting:media-control", {
+        micMuted: Boolean(muted),
+        micLocked: Boolean(muted),
+        reason: muted ? "A host muted you. You can unmute after a host allows it." : "A host allowed you to unmute."
+      });
+      await emitMeetingSnapshot(roomId);
     }));
 
     socket.on("host:toggle-lock", runSafely(async ({ roomId, locked }) => {
@@ -357,6 +491,14 @@ export function registerMeetingSockets(server) {
     socket.on("host:remove", runSafely(async ({ roomId, targetUserId }) => {
       const { meeting, participant } = await requireMeetingAccess(roomId, socket.data.user.id);
       if (!isHostLike(participant)) return;
+
+      const targetParticipant =
+        meeting.participants.find((item) => item.userId?.toString() === targetUserId?.toString()) ||
+        meeting.pendingParticipants.find((item) => item.userId?.toString() === targetUserId?.toString());
+
+      if (!canRemoveParticipant(participant, targetParticipant)) {
+        throw new Error("You do not have permission to remove this participant");
+      }
 
       if (!meeting.blockedParticipantIds.includes(targetUserId)) {
         meeting.blockedParticipantIds.push(targetUserId);

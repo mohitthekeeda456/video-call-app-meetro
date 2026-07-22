@@ -10,6 +10,7 @@ const participantSchema = new mongoose.Schema(
     leftAt: Date,
     admitted: { type: Boolean, default: true },
     micMuted: { type: Boolean, default: false },
+    micLocked: { type: Boolean, default: false },
     cameraOff: { type: Boolean, default: false },
     isSharingScreen: { type: Boolean, default: false }
   },

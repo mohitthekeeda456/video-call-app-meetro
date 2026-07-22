@@ -3,10 +3,20 @@ import { api, getStoredToken } from "./api.js";
 
 const AuthContext = createContext(null);
 
+function normalizeUser(user) {
+  if (!user) return null;
+
+  return {
+    id: user.id || user._id,
+    name: user.name,
+    email: user.email
+  };
+}
+
 function readStoredUser() {
   try {
     const value = localStorage.getItem("user");
-    return value ? JSON.parse(value) : null;
+    return value ? normalizeUser(JSON.parse(value)) : null;
   } catch {
     return null;
   }
@@ -30,8 +40,9 @@ export function AuthProvider({ children }) {
 
       try {
         const data = await api("/api/me");
-        setUser(data.user);
-        localStorage.setItem("user", JSON.stringify(data.user));
+        const normalizedUser = normalizeUser(data.user);
+        setUser(normalizedUser);
+        localStorage.setItem("user", JSON.stringify(normalizedUser));
       } catch {
         localStorage.removeItem("token");
         localStorage.removeItem("user");
@@ -51,10 +62,11 @@ export function AuthProvider({ children }) {
       user,
       ready,
       applyAuth(data) {
+        const normalizedUser = normalizeUser(data.user);
         localStorage.setItem("token", data.token);
-        localStorage.setItem("user", JSON.stringify(data.user));
+        localStorage.setItem("user", JSON.stringify(normalizedUser));
         setToken(data.token);
-        setUser(data.user);
+        setUser(normalizedUser);
       },
       logout() {
         localStorage.removeItem("token");
