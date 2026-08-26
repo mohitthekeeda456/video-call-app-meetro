@@ -34,8 +34,7 @@ export function Dashboard() {
     }
 
     setError("");
-    const query = joinPasscode ? `?passcode=${encodeURIComponent(joinPasscode)}` : "";
-    navigate(`/meeting/${roomId}${query}`);
+    navigate(`/meeting/${roomId}`, { state: { passcode: joinPasscode } });
   }
 
   async function copyInvite(meeting) {

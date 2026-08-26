@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { io } from "socket.io-client";
 import { api, getStoredToken } from "../api.js";
 import { useAuth } from "../auth.jsx";
@@ -21,12 +21,15 @@ function formatMessageTime(value) {
 export function MeetingRoom() {
   const { roomId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
   const { user } = useAuth();
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
+  const screenStreamRef = useRef(null);
   const peersRef = useRef(new Map());
   const remoteStreamsRef = useRef(new Map());
+  const remoteMediaRef = useRef(new Map());
   const screenTrackRef = useRef(null);
   const passcodeRef = useRef("");
   const joinedRef = useRef(false);
@@ -41,7 +44,7 @@ export function MeetingRoom() {
   const [meeting, setMeeting] = useState(null);
   const [messages, setMessages] = useState([]);
   const [chatText, setChatText] = useState("");
-  const [passcode, setPasscode] = useState(() => searchParams.get("passcode") || "");
+  const [passcode, setPasscode] = useState(() => location.state?.passcode || searchParams.get("passcode") || "");
   const [loading, setLoading] = useState(true);
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState("");
@@ -54,6 +57,7 @@ export function MeetingRoom() {
   const [leaving, setLeaving] = useState(false);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [mediaWarning, setMediaWarning] = useState("");
+  const [selectedStageId, setSelectedStageId] = useState("");
   const currentUserId = user?.id || user?._id;
 
   const remoteParticipants = useMemo(() => {
@@ -62,13 +66,21 @@ export function MeetingRoom() {
       .filter((participant) => participant.userId !== currentUserId)
       .map((participant) => ({
         ...participant,
-        stream: remoteStreamsRef.current.get(participant.userId) || null
+        stream: remoteStreamsRef.current.get(participant.userId) || null,
+        cameraStream: remoteMediaRef.current.get(participant.userId)?.camera || remoteStreamsRef.current.get(participant.userId) || null,
+        screenStream: remoteMediaRef.current.get(participant.userId)?.screen || null
       }));
   }, [currentUserId, meeting, remoteVersion]);
 
   useEffect(() => {
     passcodeRef.current = passcode;
   }, [passcode]);
+
+  useEffect(() => {
+    if (searchParams.has("passcode")) {
+      navigate(`/meeting/${roomId}`, { replace: true, state: { passcode: passcodeRef.current } });
+    }
+  }, [navigate, roomId, searchParams]);
 
   useEffect(() => {
     joinedRef.current = joined;
@@ -256,6 +268,7 @@ export function MeetingRoom() {
       screenTrackRef.current.stop();
       screenTrackRef.current = null;
     }
+    screenStreamRef.current = null;
 
     if (localStreamRef.current) {
       for (const track of localStreamRef.current.getTracks()) {
@@ -274,6 +287,7 @@ export function MeetingRoom() {
       peersRef.current.delete(userId);
     }
     remoteStreamsRef.current.delete(userId);
+    remoteMediaRef.current.delete(userId);
     setRemoteVersion((value) => value + 1);
   }
 
@@ -323,12 +337,32 @@ export function MeetingRoom() {
       if (!remoteStreamsRef.current.has(targetUserId)) {
         remoteStreamsRef.current.set(targetUserId, stream);
       }
+      const mediaBucket = remoteMediaRef.current.get(targetUserId) || {
+        camera: new MediaStream(),
+        screen: new MediaStream()
+      };
+      remoteMediaRef.current.set(targetUserId, mediaBucket);
 
       const incomingTracks = event.streams[0]?.getTracks?.() || [event.track];
       for (const track of incomingTracks) {
         const exists = stream.getTracks().some((existingTrack) => existingTrack.id === track.id);
         if (!exists) {
           stream.addTrack(track);
+        }
+
+        if (track.kind === "video") {
+          const participant = meeting?.participants?.find((item) => item.userId === targetUserId);
+          const shouldTreatAsScreen = Boolean(participant?.isSharingScreen) && mediaBucket.camera.getVideoTracks().some((item) => item.id !== track.id);
+          const targetStream = shouldTreatAsScreen ? mediaBucket.screen : mediaBucket.camera;
+          const alreadyAdded = targetStream.getTracks().some((existingTrack) => existingTrack.id === track.id);
+          if (!alreadyAdded) {
+            targetStream.addTrack(track);
+          }
+        } else if (track.kind === "audio") {
+          const alreadyAdded = mediaBucket.camera.getTracks().some((existingTrack) => existingTrack.id === track.id);
+          if (!alreadyAdded) {
+            mediaBucket.camera.addTrack(track);
+          }
         }
       }
 
@@ -342,6 +376,16 @@ export function MeetingRoom() {
     };
 
     return peer;
+  }
+
+  async function renegotiatePeer(targetUserId, peer) {
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    socketRef.current?.emit("signal:offer", {
+      roomId,
+      targetUserId,
+      sdp: offer
+    });
   }
 
   async function createOffersForExistingParticipants(existingParticipants) {
@@ -410,29 +454,43 @@ export function MeetingRoom() {
     syncMediaState({ ...localMediaRef.current, cameraOff });
   }
 
-  async function replaceOutgoingVideoTrack(nextTrack) {
-    for (const peer of peersRef.current.values()) {
-      const sender = peer.getSenders().find((item) => item.track?.kind === "video");
-      if (sender) {
-        await sender.replaceTrack(nextTrack);
+  async function publishScreenTrack(screenTrack, screenStream) {
+    for (const [targetUserId, peer] of peersRef.current.entries()) {
+      peer.addTrack(screenTrack, screenStream);
+      await renegotiatePeer(targetUserId, peer);
+    }
+  }
+
+  async function restoreCameraTrack() {
+    const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null;
+    for (const [targetUserId, peer] of peersRef.current.entries()) {
+      const screenSender = peer.getSenders().find((item) => item.track === screenTrackRef.current);
+      if (screenSender) {
+        peer.removeTrack(screenSender);
+        await renegotiatePeer(targetUserId, peer);
       }
     }
   }
 
   async function stopScreenShare() {
-    if (!localStreamRef.current) return;
-    const cameraTrack = localStreamRef.current.getVideoTracks()[0];
-    if (!cameraTrack) return;
+    if (!screenTrackRef.current) return;
+
+    await restoreCameraTrack();
+    const cameraTrack = localStreamRef.current?.getVideoTracks()[0];
 
     if (screenTrackRef.current) {
       screenTrackRef.current.onended = null;
       screenTrackRef.current.stop();
       screenTrackRef.current = null;
     }
+    screenStreamRef.current = null;
 
-    await replaceOutgoingVideoTrack(cameraTrack);
-    cameraTrack.enabled = !localMediaRef.current.cameraOff;
-    assignLocalPreview(localStreamRef.current);
+    if (cameraTrack) {
+      cameraTrack.enabled = !localMediaRef.current.cameraOff;
+      assignLocalPreview(localStreamRef.current);
+    } else {
+      assignLocalPreview(null);
+    }
     syncMediaState({ ...localMediaRef.current, isSharingScreen: false });
   }
 
@@ -449,12 +507,13 @@ export function MeetingRoom() {
 
       const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
       const screenTrack = displayStream.getVideoTracks()[0];
+      screenStreamRef.current = displayStream;
       screenTrackRef.current = screenTrack;
       screenTrack.onended = () => {
         stopScreenShare().catch(() => {});
       };
 
-      await replaceOutgoingVideoTrack(screenTrack);
+      await publishScreenTrack(screenTrack, displayStream);
       assignLocalPreview(new MediaStream([screenTrack, ...(localStreamRef.current?.getAudioTracks() || [])]));
       setMediaWarning("");
       syncMediaState({ ...localMediaRef.current, isSharingScreen: true });
@@ -571,6 +630,60 @@ export function MeetingRoom() {
     return false;
   };
   const canControlParticipantAudio = (participant) => canRemoveParticipant(participant);
+  const stageItems = [
+    {
+      id: "local",
+      label: `${user.name} (You)`,
+      meta: `${localRole}${localMedia.cameraOff ? " | camera off" : ""}`,
+      stream: localMedia.isSharingScreen ? (localStreamRef.current?.getVideoTracks().length ? localStreamRef.current : null) : localPreviewStream,
+      muted: true,
+      local: true,
+      isSharingScreen: false,
+      role: localRole
+    },
+    ...(localMedia.isSharingScreen
+      ? [
+          {
+            id: "local-screen",
+            label: `${user.name} screen`,
+            meta: `${localRole} | sharing screen`,
+            stream: localPreviewStream,
+            muted: true,
+            local: true,
+            isSharingScreen: true,
+            role: localRole
+          }
+        ]
+      : []),
+    ...remoteParticipants.map((participant) => ({
+      id: participant.userId,
+      label: participant.name,
+      meta: `${participant.role}${participant.micMuted ? " | muted" : ""}${participant.cameraOff ? " | camera off" : ""}`,
+      stream: participant.cameraStream,
+      muted: false,
+      local: false,
+      isSharingScreen: false,
+      role: participant.role
+    })),
+    ...remoteParticipants
+      .filter((participant) => participant.isSharingScreen)
+      .map((participant) => ({
+        id: `${participant.userId}:screen`,
+        label: `${participant.name} screen`,
+        meta: `${participant.role} | presenting`,
+        stream: participant.screenStream || participant.stream,
+        muted: false,
+        local: false,
+        isSharingScreen: true,
+        role: participant.role
+      }))
+  ];
+  const selectedStageItem =
+    stageItems.find((item) => item.id === selectedStageId) ||
+    stageItems.find((item) => item.isSharingScreen) ||
+    stageItems.find((item) => item.role === "host") ||
+    stageItems[0];
+  const sideStageItems = stageItems.filter((item) => item.id !== selectedStageItem?.id);
 
   if (loading) {
     return (
@@ -649,22 +762,31 @@ export function MeetingRoom() {
 
       <section className="grid gap-5 xl:grid-cols-[minmax(0,1.65fr)_380px]">
         <div className="grid gap-4">
-          <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-            <VideoTile
-              label={`${user.name} (You)`}
-              meta={`${localRole}${localMedia.isSharingScreen ? " | sharing screen" : ""}`}
-              stream={localPreviewStream}
-              muted
-              local
-            />
-            {remoteParticipants.map((participant) => (
-              <VideoTile
-                key={participant.userId}
-                label={participant.name}
-                meta={`${participant.role}${participant.micMuted ? " | muted" : ""}${participant.cameraOff ? " | camera off" : ""}${participant.isSharingScreen ? " | presenting" : ""}`}
-                stream={participant.stream}
-              />
-            ))}
+          <div className="grid gap-4 rounded-lg border border-slate-200 bg-white p-4 shadow-xl shadow-slate-950/5 xl:grid-cols-[minmax(0,1fr)_240px]">
+            <div className="min-w-0">
+              {selectedStageItem ? (
+                <VideoTile
+                  label={selectedStageItem.label}
+                  meta={`Main stage | ${selectedStageItem.meta}`}
+                  stream={selectedStageItem.stream}
+                  muted={selectedStageItem.muted}
+                  local={selectedStageItem.local}
+                />
+              ) : null}
+            </div>
+            <div className="grid max-h-[520px] content-start gap-3 overflow-auto pr-1">
+              <p className="text-xs font-black uppercase tracking-normal text-cyan-700">Click to focus</p>
+              {sideStageItems.map((item) => (
+                <div className="cursor-pointer rounded-lg ring-cyan-300 transition hover:-translate-y-0.5 hover:ring-2" key={item.id} onClick={() => setSelectedStageId(item.id)} role="button" tabIndex={0} onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") setSelectedStageId(item.id);
+                }}>
+                  <VideoTile label={item.label} meta={item.meta} stream={item.stream} muted={item.muted} local={item.local} />
+                </div>
+              ))}
+              {sideStageItems.length === 0 ? (
+                <div className="rounded-md bg-slate-50 p-4 text-sm font-semibold text-slate-500">Other members will appear here.</div>
+              ) : null}
+            </div>
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-xl shadow-slate-950/5">
