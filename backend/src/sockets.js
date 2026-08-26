@@ -3,6 +3,7 @@ import { User } from "./models/User.js";
 import { Meeting } from "./models/Meeting.js";
 import { Message } from "./models/Message.js";
 import { verifyAuthToken } from "./utils/auth.js";
+import { normalizeText } from "./utils/validation.js";
 import {
   appendMeetingEvent,
   canModerateParticipant,
@@ -17,6 +18,7 @@ import {
 
 let ioInstance = null;
 const activeRooms = new Map();
+const socketEventWindows = new Map();
 
 function getRoomState(roomId) {
   if (!activeRooms.has(roomId)) {
@@ -153,8 +155,19 @@ async function requireMeetingAccess(roomId, userId) {
 }
 
 export function registerMeetingSockets(server) {
+  const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
   const io = new Server(server, {
-    cors: { origin: process.env.CLIENT_ORIGIN || "http://localhost:5173", credentials: true }
+    cors: {
+      origin(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error("Not allowed by CORS"));
+      },
+      credentials: true
+    },
+    maxHttpBufferSize: 100000
   });
   ioInstance = io;
 
@@ -182,6 +195,19 @@ export function registerMeetingSockets(server) {
 
   io.on("connection", (socket) => {
     socket.join(`user:${socket.data.user.id}`);
+    const allowSocketEvent = (name, limit = 60, windowMs = 60 * 1000) => {
+      const key = `${socket.id}:${name}`;
+      const now = Date.now();
+      const current = socketEventWindows.get(key) || { count: 0, resetAt: now + windowMs };
+      if (current.resetAt <= now) {
+        socketEventWindows.set(key, { count: 1, resetAt: now + windowMs });
+        return true;
+      }
+      if (current.count >= limit) return false;
+      current.count += 1;
+      socketEventWindows.set(key, current);
+      return true;
+    };
     const runSafely = (handler) => async (...args) => {
       try {
         await handler(...args);
@@ -244,6 +270,7 @@ export function registerMeetingSockets(server) {
     });
 
     socket.on("signal:offer", ({ roomId, targetUserId, sdp }) => {
+      if (!allowSocketEvent("signal", 180)) return;
       const targetSocketId = findSocketIdForUser(roomId, targetUserId);
       if (targetSocketId) {
         io.to(targetSocketId).emit("signal:offer", {
@@ -256,6 +283,7 @@ export function registerMeetingSockets(server) {
     });
 
     socket.on("signal:answer", ({ roomId, targetUserId, sdp }) => {
+      if (!allowSocketEvent("signal", 180)) return;
       const targetSocketId = findSocketIdForUser(roomId, targetUserId);
       if (targetSocketId) {
         io.to(targetSocketId).emit("signal:answer", {
@@ -268,6 +296,7 @@ export function registerMeetingSockets(server) {
     });
 
     socket.on("signal:ice", ({ roomId, targetUserId, candidate }) => {
+      if (!allowSocketEvent("signal", 180)) return;
       const targetSocketId = findSocketIdForUser(roomId, targetUserId);
       if (targetSocketId) {
         io.to(targetSocketId).emit("signal:ice", {
@@ -321,8 +350,13 @@ export function registerMeetingSockets(server) {
     }));
 
     socket.on("chat:send", runSafely(async ({ roomId, text }, callback = () => {}) => {
+      if (!allowSocketEvent("chat", 30)) {
+        return callback({ ok: false, error: "You are sending messages too quickly" });
+      }
+      await requireMeetingAccess(roomId, socket.data.user.id);
       const meeting = await Meeting.findOne({ roomId });
-      if (!meeting || !text?.trim()) {
+      const safeText = normalizeText(text, 1000);
+      if (!meeting || !safeText) {
         return callback({ ok: false, error: "Message could not be sent" });
       }
 
@@ -330,7 +364,7 @@ export function registerMeetingSockets(server) {
         meetingId: meeting._id,
         senderId: socket.data.user.id,
         senderName: socket.data.user.name,
-        text: text.trim()
+        text: safeText
       });
 
       io.to(roomId).emit("chat:new", message);
@@ -573,6 +607,9 @@ export function registerMeetingSockets(server) {
     socket.on("disconnect", runSafely(async () => {
       const roomId = socket.data.roomId;
       const userId = socket.data.user?.id;
+      for (const key of socketEventWindows.keys()) {
+        if (key.startsWith(`${socket.id}:`)) socketEventWindows.delete(key);
+      }
 
       await handleParticipantDeparture(io, roomId, userId, socket.data.user.name);
     }));

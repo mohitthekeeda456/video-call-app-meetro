@@ -113,7 +113,7 @@ export function serializeMeeting(meeting, viewerId, activeParticipants = [], opt
     status: meeting.status,
     locked: meeting.locked,
     requireApproval: meeting.requireApproval,
-    hasPasscode: Boolean(meeting.passcode),
+    hasPasscode: Boolean(meeting.passcodeHash || meeting.passcode),
     participants: visibleParticipants.map((participant) => {
       const active = activeByUserId.get(participant.userId?.toString());
       return {

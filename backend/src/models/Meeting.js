@@ -39,6 +39,7 @@ const meetingSchema = new mongoose.Schema(
     scheduledAt: { type: Date, required: true },
     durationMinutes: { type: Number, default: 30 },
     passcode: { type: String, default: "" },
+    passcodeHash: { type: String, default: "" },
     status: { type: String, enum: ["scheduled", "live", "ended"], default: "scheduled" },
     locked: { type: Boolean, default: false },
     requireApproval: { type: Boolean, default: false },
